@@ -27,6 +27,38 @@ once, and each was verified against the real packages (not assumed):
   project writes *that* file instead of overwriting the package's own script,
   so a `pacman -Syu` upgrade of the AUR package can't silently revert your
   switching logic.
+- **The `cosmic-greeter` package fights for control of the display manager.**
+  It ships its own `cosmic-greeter.service`, which claims the
+  `display-manager.service` alias and runs a *second*, independent greetd
+  process against `/etc/greetd/cosmic-greeter.toml` — not the
+  `/etc/greetd/config.toml` this project writes. Left enabled, switching is a
+  silent no-op (wrong file) or, if you restart plain `greetd.service` anyway,
+  two greetd processes end up fighting over VT1/DRM master — the black
+  screen with a flashing cursor some users hit. This project disables
+  `cosmic-greeter.service` and enables plain `greetd.service` so there's only
+  ever one greetd in control.
+- **swhkd needs a loginuid, which a plain systemd service never gets.**
+  swhkd ≥1.2 refuses to start unless `/proc/self/loginuid` is set (an
+  anti-snooping safeguard) — a service started directly by PID 1 fails with
+  `loginuid not set for process N` and start-limit-hits. The generated
+  `swhkd.service` sets `User=root` + `PAMName=login` so systemd opens a PAM
+  session (via `/etc/pam.d/login` → `pam_loginuid.so`) before exec'ing it.
+- **Running swhkd as root points it at the wrong runtime directory.** swhkd
+  talks to `swhks` (which runs as your own user) over a socket under
+  `$XDG_RUNTIME_DIR`. Once swhkd runs as root, PAM hands it `/run/user/0`
+  instead of your user's `/run/user/<uid>`, so it polls a socket that will
+  never exist there and hotkeys silently never fire. A plain
+  `Environment=XDG_RUNTIME_DIR=...` in the unit does **not** fix this: PAM
+  (via `pam_systemd`) sets its own `XDG_RUNTIME_DIR=/run/user/0` as part of
+  opening the root session, *after* `Environment=` is applied, silently
+  overwriting it every start. The generated `swhkd.service` instead wraps
+  `ExecStart` in a shell (`sh -c "export XDG_RUNTIME_DIR=/run/user/<uid>;
+  exec /usr/bin/swhkd"`) so the variable is re-set from inside the process
+  itself, after PAM has already run, right before swhkd execs. Relatedly, this
+  build of `swhks` starts, hands off its socket, and exits almost
+  immediately by design rather than running as a persistent daemon — its
+  user service sets `StartLimitIntervalSec=0` so systemd keeps respawning it
+  instead of giving up after five quick restarts.
 - **Super+Shift+R has to work from inside gamescope**, where COSMIC (and its
   keybinding system) isn't even running. [swhkd](https://github.com/waycrate/swhkd)
   reads keyboard input directly from `/dev/input`, underneath any Wayland

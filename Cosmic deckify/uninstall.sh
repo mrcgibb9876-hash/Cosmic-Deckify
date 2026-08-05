@@ -100,12 +100,23 @@ vt = 1
 command = "agreety --cmd /bin/sh"
 user = "greeter"
 EOF
-    c_ok "greetd reset (backup at $GREETD_CONF.deckify.bak). Consider installing a graphical"
-    c_ok "greeter (e.g. cosmic-greeter or greetd-tuigreet) if you want one back."
+    c_ok "greetd reset (backup at $GREETD_CONF.deckify.bak)."
 else
     c_warn "$GREETD_CONF not found (skipped)."
 fi
 
+# install.sh disables cosmic-greeter.service (its own greeter+greetd pair) and
+# enables plain greetd.service so this project's switch helper controls the
+# real display manager. Reverse that here so COSMIC's native graphical login
+# screen comes back instead of leaving the machine on the stock-agreety config
+# above.
+if systemctl list-unit-files cosmic-greeter.service &>/dev/null; then
+    c_info "Restoring cosmic-greeter.service as the display manager..."
+    sudo systemctl disable greetd.service 2>/dev/null || true
+    sudo systemctl enable cosmic-greeter.service
+    c_ok "cosmic-greeter.service restored (takes effect on reboot)."
+fi
+
 echo
 c_ok "Uninstall complete."
-echo    "  • Restart greetd (or reboot) to apply: sudo systemctl restart greetd"
+echo    "  • Reboot to apply the display-manager change cleanly."

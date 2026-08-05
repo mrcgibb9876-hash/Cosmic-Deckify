@@ -48,6 +48,8 @@ SHORTCUT="Return_to_Gaming_Mode.desktop"
 COSMIC_CMD="/usr/bin/start-cosmic"
 GAMESCOPE_CMD="gamescope-session-plus steam"
 TARGET_USER="$(whoami)"
+TARGET_UID="$(id -u "$TARGET_USER")"
+BACKLIGHT_DEV="$(ls /sys/class/backlight 2>/dev/null | head -n1)"
 
 c_info() { echo -e "\n\e[36m[*]\e[0m $1"; }
 c_ok()   { echo -e "\e[32m[ok]\e[0m $1"; }
@@ -194,6 +196,22 @@ user = "$TARGET_USER"
 EOF
 c_ok "greetd will auto-launch COSMIC for $TARGET_USER on VT1."
 
+# The `cosmic-greeter` package ships its OWN systemd unit (cosmic-greeter.service)
+# that runs a *second*, independent greetd process against a different config
+# file (/etc/greetd/cosmic-greeter.toml) and claims the display-manager.service
+# alias for itself. If that unit stays enabled, deckify-session-switch's edits
+# to $GREETD_CONF and `systemctl restart greetd.service` are a no-op at boot,
+# and a live switch starts a second greetd fighting the first over VT1/DRM
+# master — this is what a black screen with a flashing cursor after a switch
+# means. Make plain greetd.service the one true display manager instead.
+if systemctl list-unit-files cosmic-greeter.service &>/dev/null; then
+    c_info "Disabling cosmic-greeter.service's own greeter so plain greetd.service"
+    c_info "(the one this script controls) owns display-manager.service..."
+    sudo systemctl disable cosmic-greeter.service 2>/dev/null || true
+    sudo systemctl enable greetd.service
+    c_ok "greetd.service is now the active display manager (takes effect on reboot)."
+fi
+
 # ---------------------------------------------------------------------------
 # 9. Root switch helper — the only thing sudoers grants NOPASSWD access to
 # ---------------------------------------------------------------------------
@@ -207,6 +225,7 @@ set -euo pipefail
 
 GREETD_CONF="$GREETD_CONF"
 TARGET_USER="$TARGET_USER"
+TARGET_UID="$TARGET_UID"
 COSMIC_CMD="$COSMIC_CMD"
 GAMESCOPE_CMD="$GAMESCOPE_CMD"
 
@@ -224,6 +243,22 @@ case "\${1:-}" in
         echo "Usage: \$0 {gamescope|desktop}" >&2
         exit 1 ;;
 esac
+
+# \`loginctl enable-linger\` (needed to keep swhks alive underneath any
+# session) keeps \$TARGET_USER's systemd --user manager running across the
+# "logout" that \`systemctl restart greetd\` causes. That manager's exported
+# activation environment (WAYLAND_DISPLAY, DISPLAY) is NOT cleared by that
+# forced logout, so the outgoing compositor's now-dead display handles are
+# still there when the incoming session's user units start. gamescope's
+# wlroots backend sees a stale WAYLAND_DISPLAY, tries to connect to it as a
+# *client* instead of taking the DRM/KMS backend directly, fails ("Failed to
+# connect to wayland socket"), and gamescope-session-plus's own short-session
+# guard then silently falls back to the desktop session — this is the "black
+# screen, no sound, falls back to desktop" failure mode. Clearing both before
+# every switch (either direction) forces the new session to re-detect its
+# backend cleanly instead of inheriting the old one's corpse.
+sudo -u "\$TARGET_USER" env XDG_RUNTIME_DIR="/run/user/\$TARGET_UID" \\
+    systemctl --user unset-environment WAYLAND_DISPLAY DISPLAY 2>/dev/null || true
 
 cat > "\$GREETD_CONF" <<INNER
 [terminal]
@@ -384,6 +419,18 @@ cat > "$SUDOERS_TMP" <<EOF
 $TARGET_USER ALL=(root) NOPASSWD: $SWITCH_HELPER gamescope
 $TARGET_USER ALL=(root) NOPASSWD: $SWITCH_HELPER desktop
 EOF
+# Steam/gamescope's own brightness-fade animation writes the backlight via
+# `sudo tee /sys/class/backlight/<dev>/brightness` (not systemd-logind's
+# SetBrightness D-Bus call, which is what COSMIC's own slider uses) and has
+# no interactive TTY to prompt on, so without this it silently fails on
+# every attempt — every fade write is dropped and the backlight is left
+# wherever it last was (observed: pinned at max), which is what a "screen is
+# super bright after returning to desktop" report is.
+if [ -n "$BACKLIGHT_DEV" ]; then
+    echo "$TARGET_USER ALL=(root) NOPASSWD: /usr/bin/tee /sys/class/backlight/$BACKLIGHT_DEV/brightness" >> "$SUDOERS_TMP"
+else
+    c_warn "No /sys/class/backlight device found — skipping the brightness sudoers grant."
+fi
 if sudo visudo -c -f "$SUDOERS_TMP" &>/dev/null; then
     sudo install -m 440 -o root -g root "$SUDOERS_TMP" "$SUDOERS_FILE"
     c_ok "sudoers rule installed."
@@ -409,13 +456,38 @@ super + shift + r
 	steamos-session-select desktop
 EOF
 
-sudo tee /etc/systemd/system/swhkd.service >/dev/null <<'EOF'
+sudo tee /etc/systemd/system/swhkd.service >/dev/null <<EOF
 [Unit]
 Description=Simple Wayland HotKey Daemon
 After=local-fs.target
 
 [Service]
-ExecStart=/usr/bin/swhkd
+# swhkd (>=1.2) refuses to start unless /proc/self/loginuid is set, as a
+# safeguard against being run outside a real login session. A plain systemd
+# system service started by PID 1 never gets one (that error surfaces as
+# \`Error: "loginuid not set for process N"\` and the unit start-limit-hits).
+# PAMName=login makes systemd open a PAM session using /etc/pam.d/login
+# (which pulls in pam_loginuid.so via system-login) before exec'ing swhkd,
+# which sets it. PAMName requires User= to be set explicitly.
+#
+# Because swhkd runs as root, PAM (via systemd-logind) hands it its own
+# XDG_RUNTIME_DIR at /run/user/0. But swhks -- swhkd's IPC handshake partner,
+# which creates the socket swhkd waits on -- runs as \$TARGET_USER's systemd
+# --user instance and creates its socket under /run/user/\$TARGET_UID. Without
+# forcing swhkd to look in the same runtime dir, it polls a socket that will
+# never exist and hotkeys silently never fire.
+#
+# A plain Environment=XDG_RUNTIME_DIR=... here does NOT work: PAMName=login
+# opens the PAM session for User= (root), and pam_systemd sets its own
+# XDG_RUNTIME_DIR=/run/user/0 as part of that session setup -- which happens
+# *after* Environment= is applied, silently overwriting it on every start.
+# The only way to make it stick is to re-set it from inside the process
+# itself, after PAM has already run, right before swhkd execs -- hence the
+# shell wrapper below instead of a bare ExecStart=/usr/bin/swhkd.
+User=root
+PAMName=login
+ExecStart=
+ExecStart=/bin/sh -c "export XDG_RUNTIME_DIR=/run/user/$TARGET_UID; exec /usr/bin/swhkd"
 Restart=always
 RestartSec=1
 
@@ -427,6 +499,12 @@ mkdir -p "$HOME/.config/systemd/user"
 tee "$HOME/.config/systemd/user/swhks.service" >/dev/null <<'EOF'
 [Unit]
 Description=swhkd IPC server (environment sourcing for swhkd)
+# This build of swhks starts, hands swhkd its socket/env, and exits almost
+# immediately by design -- it's not a persistent daemon. swhkd polls for
+# that socket continuously, so swhks must keep respawning indefinitely
+# rather than tripping systemd's default 5-restarts-in-10s burst limit and
+# landing in a dead "start-limit-hit" state.
+StartLimitIntervalSec=0
 
 [Service]
 ExecStart=/usr/bin/swhks
