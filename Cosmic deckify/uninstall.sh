@@ -37,6 +37,7 @@ echo    "  • swhkd.service (system) and swhks.service (user), and swhkd-git"
 echo    "  • gamescope-session-steam-git / gamescope-session-git"
 echo    "  • $OS_SESSION_SELECT and $SWITCH_HELPER"
 echo    "  • $SUDOERS_FILE"
+echo    "  • the gamescope-session-update pacman hook + its sync script"
 echo    "  • 'Return to Gaming Mode' shortcut (desktop + app menu) and its icon"
 echo    "  • greetd autologin (reset to the stock greeter — you'll get a login prompt)"
 echo
@@ -77,6 +78,7 @@ fi
 # --- 3. hook, helper, sudoers ------------------------------------------------
 c_info "Removing os-session-select hook, switch helper, and sudoers rule..."
 sudo rm -f "$OS_SESSION_SELECT" "$SWITCH_HELPER" "$SUDOERS_FILE"
+sudo rm -f /etc/pacman.d/hooks/deckify-gamescope-session.hook /usr/local/bin/deckify-sync-gamescope-session
 c_ok "Removed."
 
 # --- 4. shortcut + icon ------------------------------------------------------
