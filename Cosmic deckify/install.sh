@@ -1,41 +1,53 @@
 #!/bin/bash
 #
-# Arch Deckify — COSMIC / NVIDIA edition
+# Cosmic Deckify — vanilla Arch + COSMIC + gamescope, hotkey-switched
 # ===========================================================================
-# A streamlined fork of unlbslk/arch-deckify that sets up a SteamOS-style
-# gamescope gaming session on Arch under SDDM, tuned for machines where a
-# LIVE desktop->gaming handoff doesn't work (notably NVIDIA + COSMIC).
+# Sets up a SteamOS-style Gaming Mode (gamescope + Steam Big Picture) on a
+# vanilla Arch install running COSMIC, and wires Super+Shift+S / Super+Shift+R
+# as global hotkeys to switch between COSMIC and Gaming Mode.
 #
-# What differs from upstream:
-#   * Gaming switch REBOOTS into the gamescope session instead of doing a live
-#     compositor handoff. On NVIDIA + COSMIC the live handoff black-screens
-#     (COSMIC doesn't release the DRM master, so gamescope autologins onto a
-#     dead display — Steam chime plays, nothing renders). A reboot fully resets
-#     the GPU and SDDM autologin brings gamescope up clean. Toggle in the
-#     switcher via SWITCH_METHOD=live if you're on a setup that hands off fine.
-#   * gamescope-session-steam-git is FORCED from the AUR (aur/ prefix) and the
-#     CachyOS gamescope-session-cachyos provider is removed first, so it can't
-#     hijack the package or the gamescope-session dependency.
-#   * The gaming-mode icon is installed into the hicolor icon theme and
-#     referenced by NAME, so COSMIC actually renders it.
-#   * Fixes a latent upstream bug where the desktop session name was written
-#     into the switcher literally ($selected_de) instead of expanded.
-#   * Drops the Deckify Helper / Decky Loader / system_update extras to keep
-#     the installer focused. Removal is handled by the separate uninstall.sh.
+# Architecture (verified against the real packages, not guessed):
+#   * COSMIC on Arch boots via greetd + cosmic-greeter, NOT SDDM. greetd's
+#     `default_session` is "the greeter" by convention, but nothing stops it
+#     being pointed straight at a real session command — per greetd(1)/(5),
+#     doing so IS its auto-login mechanism: "the default session ... started
+#     again whenever no session is running, such as when the user logs out."
+#     Confirmed against greetd's source: config.toml is parsed exactly once at
+#     daemon startup (no SIGHUP/reload support), so switching sessions means
+#     editing config.toml AND restarting greetd.service — not just logging out.
+#   * gamescope-session-steam-git (AUR) ships its OWN /usr/bin/steamos-session-select,
+#     which is a thin dispatcher: it execs /usr/lib/os-session-select (or
+#     /usr/libexec/os-session-select) if present, else just runs `steam -shutdown`.
+#     This script writes /usr/lib/os-session-select instead of clobbering the
+#     package's own file — clobbering it would silently revert on the next
+#     package update and fights pacman's file ownership.
+#   * Super+Shift+R has to work from *inside* gamescope, where COSMIC (and its
+#     keybinding system) isn't running. swhkd reads raw evdev directly, below
+#     any Wayland compositor, so it keeps working no matter which session has
+#     the screen. It ships no systemd units, so this script writes them.
+#   * NVIDIA's proprietary driver is widely reported to not release the DRM
+#     master cleanly to a second compositor on a live handoff. `systemctl
+#     restart greetd` forcibly kills the whole session cgroup (not a polite
+#     compositor-side logout), which is a better bet than a live handoff, but
+#     is NOT guaranteed clean on every driver/kernel combo — this needs to be
+#     verified on your actual hardware. A full-reboot fallback is one flag
+#     away in the generated switch helper if the fast path black-screens.
 #
-# Credits: unlbslk/arch-deckify and the ChimeraOS gamescope-session-steam team.
-# Use at your own risk — it edits SDDM config, sudoers, and system packages.
+# Run without sudo — it will sudo where needed.
 # ===========================================================================
 
 set -uo pipefail
 
-SWITCHER="/usr/bin/steamos-session-select"
-SDDM_CONF="/etc/sddm.conf"
-SUDOERS_FILE="/etc/sudoers.d/sddm_config_edit"
+GREETD_CONF="/etc/greetd/config.toml"
+SWITCH_HELPER="/usr/local/bin/deckify-session-switch"
+OS_SESSION_SELECT="/usr/lib/os-session-select"
+SUDOERS_FILE="/etc/sudoers.d/deckify-session-switch"
+SWHKD_CONF="/etc/swhkd/swhkdrc"
 ICON_NAME="steam-gaming-return"
-ICON_URL="https://raw.githubusercontent.com/unlbslk/arch-deckify/refs/heads/main/icons/${ICON_NAME}.png"
-GAMING_SESSION="gamescope-session-steam"
 SHORTCUT="Return_to_Gaming_Mode.desktop"
+COSMIC_CMD="/usr/bin/start-cosmic"
+GAMESCOPE_CMD="gamescope-session-plus steam"
+TARGET_USER="$(whoami)"
 
 c_info() { echo -e "\n\e[36m[*]\e[0m $1"; }
 c_ok()   { echo -e "\e[32m[ok]\e[0m $1"; }
@@ -47,48 +59,25 @@ if [ "$EUID" -eq 0 ]; then
     exit 1
 fi
 
-echo -e "\n\e[1;33mArch Deckify — COSMIC / NVIDIA edition\e[0m"
+command -v pacman &>/dev/null || { c_err "This installer is for Arch (or an Arch-based distro) only."; exit 1; }
+
+echo -e "\n\e[1;33mCosmic Deckify — Arch + COSMIC + gamescope, hotkey-switched\e[0m"
 echo -e "\e[1;30m(To remove everything later, run: bash uninstall.sh)\e[0m"
 
+sudo -v
+
 # ---------------------------------------------------------------------------
-# Preflight: SDDM must be the display manager
+# GPU detection — only NVIDIA needs the modeset workaround / reboot fallback
 # ---------------------------------------------------------------------------
-dm=$(basename "$(readlink /etc/systemd/system/display-manager.service 2>/dev/null)" 2>/dev/null)
-if [ "$dm" != "sddm.service" ]; then
-    c_err "SDDM is not the active display manager."
-    read -rp "Install and enable SDDM now? (y/n): " a
-    if [[ "$a" =~ ^[Yy]$ ]]; then
-        pacman -Qi sddm &>/dev/null || sudo pacman -S sddm --noconfirm
-        pacman -Qi sddm &>/dev/null || { c_err "SDDM install failed."; exit 1; }
-        sudo systemctl disable display-manager.service 2>/dev/null || true
-        sudo systemctl enable sddm.service
-        c_ok "SDDM enabled."
-    else
-        exit 1
-    fi
+IS_NVIDIA=0
+if lspci -k 2>/dev/null | grep -qi 'nvidia'; then
+    IS_NVIDIA=1
+    c_warn "NVIDIA GPU detected. Live session switching is a known-fragile area on"
+    c_warn "NVIDIA + Wayland (the driver doesn't always release DRM master cleanly"
+    c_warn "to a second compositor). This installer sets up the fast path"
+    c_warn "(systemctl restart greetd) by default, with a reboot fallback you can"
+    c_warn "enable in $SWITCH_HELPER if it black-screens on your hardware."
 fi
-
-sudo -v   # prime sudo
-
-# ---------------------------------------------------------------------------
-# Choose the desktop session to return to
-# ---------------------------------------------------------------------------
-available_desktops=$(ls /usr/share/wayland-sessions/*.desktop 2>/dev/null \
-    | sed 's|/usr/share/wayland-sessions/||; s/\.desktop$//' | grep -v 'gamescope')
-
-[ -n "$available_desktops" ] || { c_err "No non-gamescope Wayland session found for desktop mode."; exit 1; }
-
-while true; do
-    echo -e "\n\e[95mWayland desktop sessions found:\e[0m"
-    echo "$available_desktops"
-    echo -e "\n\e[95mWhich should be used when switching Steam -> desktop?\e[0m"
-    read -rp "Session name: " selected_de
-    if echo "$available_desktops" | grep -qw "^$selected_de"; then
-        c_ok "'$selected_de' selected."
-        break
-    fi
-    c_warn "No session named '$selected_de'."
-done
 
 # ---------------------------------------------------------------------------
 # 1. AUR helper
@@ -99,14 +88,15 @@ elif command -v paru &>/dev/null; then c_ok "paru present."
 else
     c_info "Installing yay..."
     sudo pacman -S --needed base-devel git --noconfirm
-    tmp=$(mktemp -d); git clone https://aur.archlinux.org/yay.git "$tmp/yay"
+    tmp=$(mktemp -d); git clone https://aur.archlinux.org/yay-bin.git "$tmp/yay"
     ( cd "$tmp/yay" && makepkg -si --noconfirm )
     command -v yay &>/dev/null || { c_err "yay install failed."; exit 1; }
     c_ok "yay installed."
 fi
+AUR_HELPER="$(command -v yay || command -v paru)"
 
 # ---------------------------------------------------------------------------
-# 2. multilib
+# 2. multilib + system update
 # ---------------------------------------------------------------------------
 c_info "[2/13] Ensuring multilib is enabled..."
 if ! grep -q "^\[multilib\]" /etc/pacman.conf; then
@@ -115,208 +105,290 @@ if ! grep -q "^\[multilib\]" /etc/pacman.conf; then
 else
     c_ok "multilib already enabled."
 fi
-
-# ---------------------------------------------------------------------------
-# 3. system update
-# ---------------------------------------------------------------------------
-c_info "[3/13] Updating the system..."
+c_info "Updating the system..."
 sudo pacman -Syu --noconfirm
 
 # ---------------------------------------------------------------------------
-# 4. Steam
+# 3. COSMIC + greetd
 # ---------------------------------------------------------------------------
-c_info "[4/13] Ensuring Steam is installed..."
-command -v steam &>/dev/null && c_ok "Steam present." || sudo pacman -S steam --noconfirm
+c_info "[3/13] Installing COSMIC desktop + greetd..."
+sudo pacman -S --needed --noconfirm cosmic greetd greetd-tuigreet
+for pkg in cosmic-session cosmic-comp cosmic-greeter greetd; do
+    pacman -Qq "$pkg" &>/dev/null || { c_err "$pkg failed to install — check the pacman output above (e.g. a file conflict) and re-run."; exit 1; }
+done
+c_ok "COSMIC + greetd installed."
 
 # ---------------------------------------------------------------------------
-# 5. gamescope-session-steam-git (FORCED from AUR; remove CachyOS provider)
+# 4. Steam + gamescope
 # ---------------------------------------------------------------------------
-c_info "[5/13] Installing gamescope-session-steam-git (forced AUR)..."
+c_info "[4/13] Installing Steam + gamescope..."
+sudo pacman -S --needed --noconfirm steam gamescope
+for pkg in steam gamescope; do
+    pacman -Qq "$pkg" &>/dev/null || { c_err "$pkg failed to install — check the pacman output above and re-run."; exit 1; }
+done
+c_ok "Steam + gamescope installed."
 
-# The CachyOS 'gamescope-session-cachyos' package provides gamescope-session
-# and will hijack either the package name or the dependency. Remove it first.
-if pacman -Qq 2>/dev/null | grep -q '^gamescope-session-cachyos$'; then
-    c_warn "CachyOS gamescope-session-cachyos found — it conflicts and must go."
-    c_warn "(Reinstall later with: sudo pacman -S gamescope-session-cachyos)"
-    read -rp "Remove it to continue? (y/n): " a
-    [[ "$a" =~ ^[Yy]$ ]] || { c_err "Cancelled."; exit 1; }
-    pacman -Qq | grep '^gamescope-session' | grep -v 'steam' | xargs -r sudo pacman -R --noconfirm
-    sudo rm -f /usr/share/wayland-sessions/gamescope-session.desktop \
-               /etc/sddm.conf.d/zz-steamos-autologin.conf
-fi
-
-# aur/ prefix forces the AUR package over any same-named/binary provider.
-yay -S --noconfirm --sudoloop aur/gamescope-session-steam-git \
-  || paru -S --noconfirm aur/gamescope-session-steam-git
-
-if ! pacman -Qq 2>/dev/null | grep -q '^gamescope-session-steam-git$'; then
-    c_err "gamescope-session-steam-git did not install. Check for AUR conflicts and re-run."
+# ---------------------------------------------------------------------------
+# 5. gamescope-session-steam-git (AUR)
+# ---------------------------------------------------------------------------
+c_info "[5/13] Installing gamescope-session-steam-git (AUR)..."
+"$AUR_HELPER" -S --noconfirm --needed aur/gamescope-session-git aur/gamescope-session-steam-git
+if ! pacman -Qq gamescope-session-steam-git &>/dev/null; then
+    c_err "gamescope-session-steam-git did not install. Re-run after checking for AUR conflicts."
     exit 1
 fi
-c_ok "gamescope-session-steam-git installed from AUR."
+c_ok "gamescope-session-steam-git installed."
+[ -f /usr/share/wayland-sessions/gamescope-session-steam.desktop ] \
+    || c_warn "Expected session file not found — the AUR package may have changed layout."
 
 # ---------------------------------------------------------------------------
-# 6. SDDM autologin
+# 6. swhkd-git (AUR) — global hotkey daemon, works underneath any compositor
 # ---------------------------------------------------------------------------
-c_info "[6/13] Configuring SDDM autologin..."
-sudo tee "$SDDM_CONF" >/dev/null <<EOF
-[Autologin]
-Relogin=true
-Session=$selected_de
-User=$(whoami)
+c_info "[6/13] Installing swhkd-git (AUR)..."
+"$AUR_HELPER" -S --noconfirm --needed aur/swhkd-git
+command -v swhkd &>/dev/null || { c_err "swhkd install failed."; exit 1; }
+c_ok "swhkd installed."
 
-[General]
-HaltCommand=/usr/bin/systemctl poweroff
-RebootCommand=/usr/bin/systemctl reboot
-
-[Theme]
-Current=
-
-[Users]
-MaximumUid=60513
-MinimumUid=1000
-EOF
-c_ok "Autologin set for $(whoami) (default session: $selected_de)."
+sudo usermod -aG input "$TARGET_USER"
+c_ok "$TARGET_USER added to 'input' group (needed for swhkd's raw evdev access)."
 
 # ---------------------------------------------------------------------------
-# 7. steamos-session-select  (REBOOT-based gaming switch, desktop baked in)
+# 7. NVIDIA: nvidia_drm.modeset=1 + early KMS (only if NVIDIA present)
 # ---------------------------------------------------------------------------
-c_info "[7/13] Writing $SWITCHER..."
-# NOTE: $selected_de is expanded HERE (install time). Runtime vars are \$-escaped.
-sudo tee "$SWITCHER" >/dev/null <<EOF
-#!/usr/bin/bash
-# Generated by Arch Deckify (COSMIC/NVIDIA edition).
-CONFIG_FILE="$SDDM_CONF"
-DESKTOP_SESSION="$selected_de"          # your desktop session (baked in at install)
-GAMING_SESSION="$GAMING_SESSION"
-
-# How to enter gaming mode from the desktop:
-#   reboot : reset the GPU and autologin into gamescope (reliable on NVIDIA+COSMIC)
-#   live   : classic in-place logout->relogin (fine where the GPU hands off cleanly)
-SWITCH_METHOD="reboot"
-
-if [ \$# -eq 0 ]; then
-    echo "Valid arguments: plasma, gamescope"
-    exit 0
-fi
-
-# Steam always calls "steamos-session-select plasma" to reach the desktop; we
-# treat plasma/desktop the same and switch to \$DESKTOP_SESSION.
-if [ "\$1" = "plasma" ] || [ "\$1" = "desktop" ]; then
-    echo "Switching session to Desktop (\$DESKTOP_SESSION)."
-    [ -f "\$CONFIG_FILE" ] || { echo "SDDM config not found at \$CONFIG_FILE"; exit 1; }
-    sudo sed -i "s/^Session=.*/Session=\${DESKTOP_SESSION}/" "\$CONFIG_FILE"
-    steam -shutdown
-
-elif [ "\$1" = "gamescope" ]; then
-    echo "Switching session to Gamescope."
-    [ -f "\$CONFIG_FILE" ] || { echo "SDDM config not found at \$CONFIG_FILE"; exit 1; }
-    sudo sed -i "s/^Session=.*/Session=\${GAMING_SESSION}/" "\$CONFIG_FILE"
-    if [ "\$SWITCH_METHOD" = "live" ]; then
-        niri msg action quit -s \\
-          || dbus-send --session --type=method_call --print-reply --dest=org.kde.Shutdown /Shutdown org.kde.Shutdown.logout \\
-          || gnome-session-quit --logout --no-prompt \\
-          || cinnamon-session-quit --logout --no-prompt \\
-          || loginctl terminate-session "\${XDG_SESSION_ID}"
+c_info "[7/13] NVIDIA modeset check..."
+if [ "$IS_NVIDIA" -eq 1 ]; then
+    if ! { pacman -Qq nvidia &>/dev/null || pacman -Qq nvidia-open &>/dev/null; }; then
+        c_warn "No nvidia/nvidia-open driver package detected."
+        read -rp "Install 'nvidia-open nvidia-utils' now? (y/n): " a
+        [[ "$a" =~ ^[Yy]$ ]] && sudo pacman -S --needed --noconfirm nvidia-open nvidia-utils
+    fi
+    sudo mkdir -p /etc/modprobe.d
+    if ! grep -qs 'modeset=1' /etc/modprobe.d/nvidia.conf 2>/dev/null; then
+        echo 'options nvidia_drm modeset=1 fbdev=1' | sudo tee /etc/modprobe.d/nvidia.conf >/dev/null
+        c_ok "Set nvidia_drm modeset=1 in /etc/modprobe.d/nvidia.conf."
     else
-        systemctl reboot
+        c_ok "nvidia_drm modeset=1 already configured."
+    fi
+    if [ -f /etc/mkinitcpio.conf ] && ! grep -qE '^MODULES=.*nvidia_drm' /etc/mkinitcpio.conf; then
+        sudo sed -i -E 's/^MODULES=\(([^)]*)\)/MODULES=(\1 nvidia nvidia_modeset nvidia_uvm nvidia_drm)/' /etc/mkinitcpio.conf
+        sudo sed -i -E 's/MODULES=\( +/MODULES=(/' /etc/mkinitcpio.conf
+        sudo mkinitcpio -P
+        c_ok "Added early KMS nvidia modules to mkinitcpio and regenerated initramfs."
+        c_warn "This specific change needs a REBOOT to take effect (unrelated to session switching)."
     fi
 else
-    echo "Valid arguments are: plasma, gamescope."
-    exit 1
+    c_ok "No NVIDIA GPU detected — skipping (your GPU's KMS driver handles this natively)."
+fi
+
+# ---------------------------------------------------------------------------
+# 8. greetd config: perpetual autologin into COSMIC
+# ---------------------------------------------------------------------------
+c_info "[8/13] Configuring greetd autologin (COSMIC by default)..."
+sudo tee "$GREETD_CONF" >/dev/null <<EOF
+[terminal]
+vt = 1
+
+[default_session]
+command = "$COSMIC_CMD"
+user = "$TARGET_USER"
+EOF
+c_ok "greetd will auto-launch COSMIC for $TARGET_USER on VT1."
+
+# ---------------------------------------------------------------------------
+# 9. Root switch helper — the only thing sudoers grants NOPASSWD access to
+# ---------------------------------------------------------------------------
+c_info "[9/13] Writing $SWITCH_HELPER..."
+sudo tee "$SWITCH_HELPER" >/dev/null <<EOF
+#!/bin/bash
+# Generated by Cosmic Deckify. Rewrites greetd's default_session and restarts
+# greetd so it picks up the change (greetd only reads config.toml once at its
+# own startup — see greetd(5) — so a plain logout is NOT enough).
+set -euo pipefail
+
+GREETD_CONF="$GREETD_CONF"
+TARGET_USER="$TARGET_USER"
+COSMIC_CMD="$COSMIC_CMD"
+GAMESCOPE_CMD="$GAMESCOPE_CMD"
+
+# Set to "reboot" here if a plain greetd restart doesn't cleanly hand off the
+# GPU on your NVIDIA/kernel combination — costs time but resets the DRM state
+# fully. Try the default first.
+SWITCH_METHOD="restart"
+
+case "\${1:-}" in
+    gamescope)
+        cmd="\$GAMESCOPE_CMD" ;;
+    desktop)
+        cmd="\$COSMIC_CMD" ;;
+    *)
+        echo "Usage: \$0 {gamescope|desktop}" >&2
+        exit 1 ;;
+esac
+
+cat > "\$GREETD_CONF" <<INNER
+[terminal]
+vt = 1
+
+[default_session]
+command = "\$cmd"
+user = "\$TARGET_USER"
+INNER
+
+if [ "\$SWITCH_METHOD" = "reboot" ]; then
+    systemctl reboot
+else
+    systemctl restart greetd.service
 fi
 EOF
-sudo chmod +x "$SWITCHER"
-c_ok "Switcher written (gaming = reboot; desktop = $selected_de)."
+sudo chmod 755 "$SWITCH_HELPER"
+sudo chown root:root "$SWITCH_HELPER"
+c_ok "Switch helper written."
 
 # ---------------------------------------------------------------------------
-# 8. sudoers rule (passwordless Session= edit; reboot itself needs no sudo)
+# 10. os-session-select hook — the AUR package's own steamos-session-select
+#     dispatches here; we do NOT touch /usr/bin/steamos-session-select itself.
 # ---------------------------------------------------------------------------
-c_info "[8/13] Adding sudoers rule for the Session= edit..."
-if [ ! -f "$SUDOERS_FILE" ]; then
-    echo "ALL ALL=(ALL) NOPASSWD: /usr/bin/sed -i s/^Session=*/Session=*/ ${SDDM_CONF}" \
-        | sudo tee "$SUDOERS_FILE" >/dev/null
-    sudo chmod 440 "$SUDOERS_FILE"
-    c_ok "sudoers rule added."
+c_info "[10/13] Writing $OS_SESSION_SELECT..."
+sudo mkdir -p "$(dirname "$OS_SESSION_SELECT")"
+sudo tee "$OS_SESSION_SELECT" >/dev/null <<EOF
+#!/bin/bash
+# Generated by Cosmic Deckify.
+# steamos-session-select (from gamescope-session-steam-git) execs this file
+# with "plasma"|"desktop"|"gamescope" as \$1 — Steam's own UI always passes
+# "plasma" for its "Switch to Desktop" action, regardless of your actual DE.
+case "\${1:-}" in
+    plasma|desktop)
+        exec sudo -n "$SWITCH_HELPER" desktop ;;
+    gamescope)
+        exec sudo -n "$SWITCH_HELPER" gamescope ;;
+    *)
+        echo "Valid arguments: desktop, gamescope" >&2
+        exit 1 ;;
+esac
+EOF
+sudo chmod 755 "$OS_SESSION_SELECT"
+c_ok "os-session-select hook installed."
+
+# ---------------------------------------------------------------------------
+# 11. sudoers — two literal commands only, no wildcards
+# ---------------------------------------------------------------------------
+c_info "[11/13] Adding sudoers rule..."
+SUDOERS_TMP="$(mktemp)"
+cat > "$SUDOERS_TMP" <<EOF
+$TARGET_USER ALL=(root) NOPASSWD: $SWITCH_HELPER gamescope
+$TARGET_USER ALL=(root) NOPASSWD: $SWITCH_HELPER desktop
+EOF
+if sudo visudo -c -f "$SUDOERS_TMP" &>/dev/null; then
+    sudo install -m 440 -o root -g root "$SUDOERS_TMP" "$SUDOERS_FILE"
+    c_ok "sudoers rule installed."
 else
-    c_ok "sudoers rule already present."
+    c_err "Generated sudoers file failed validation — not installed. Session switching will prompt for a password."
+fi
+rm -f "$SUDOERS_TMP"
+
+# ---------------------------------------------------------------------------
+# 12. swhkd: hotkeys + systemd units (none are shipped by the AUR package)
+# ---------------------------------------------------------------------------
+c_info "[12/13] Configuring Super+Shift+S / Super+Shift+R hotkeys..."
+sudo mkdir -p "$(dirname "$SWHKD_CONF")"
+sudo tee "$SWHKD_CONF" >/dev/null <<'EOF'
+# Generated by Cosmic Deckify.
+# Desktop (COSMIC) -> Gaming Mode
+super + shift + s
+	steamos-session-select gamescope
+
+# Gaming Mode -> Desktop (works from inside gamescope: swhkd grabs evdev
+# directly, independent of whichever compositor currently owns the screen)
+super + shift + r
+	steamos-session-select desktop
+EOF
+
+sudo tee /etc/systemd/system/swhkd.service >/dev/null <<'EOF'
+[Unit]
+Description=Simple Wayland HotKey Daemon
+After=local-fs.target
+
+[Service]
+ExecStart=/usr/bin/swhkd
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+mkdir -p "$HOME/.config/systemd/user"
+tee "$HOME/.config/systemd/user/swhks.service" >/dev/null <<'EOF'
+[Unit]
+Description=swhkd IPC server (environment sourcing for swhkd)
+
+[Service]
+ExecStart=/usr/bin/swhks
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=default.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now swhkd.service
+sudo loginctl enable-linger "$TARGET_USER"
+systemctl --user daemon-reload
+systemctl --user enable --now swhks.service
+
+if systemctl is-active --quiet swhkd.service && systemctl --user is-active --quiet swhks.service; then
+    c_ok "Hotkeys active: Super+Shift+S (desktop->gaming), Super+Shift+R (gaming->desktop)."
+else
+    c_warn "swhkd/swhks did not report as active — hotkeys may not work until you check:"
+    c_warn "  systemctl status swhkd.service ; systemctl --user status swhks.service"
 fi
 
 # ---------------------------------------------------------------------------
-# 9. supporting packages
+# 13. Desktop shortcut (mouse-driven fallback alongside the hotkey)
 # ---------------------------------------------------------------------------
-c_info "[9/13] Installing supporting packages (mangohud, ntfs-3g, gamescope)..."
-for pkg in mangohud ntfs-3g gamescope wget; do
-    pacman -Qs "$pkg" >/dev/null || sudo pacman -S "$pkg" --noconfirm
-done
-c_ok "Supporting packages present."
-
-# ---------------------------------------------------------------------------
-# 10. backlight rule (brightness control from Steam on handhelds/laptops)
-# ---------------------------------------------------------------------------
-c_info "[10/13] Adding backlight udev rule..."
-sudo usermod -aG video "$(whoami)"
-if ! grep -qs 'SUBSYSTEM=="backlight"' /etc/udev/rules.d/backlight.rules 2>/dev/null; then
-    echo 'ACTION=="add", SUBSYSTEM=="backlight", RUN+="/bin/chgrp video $sys$devpath/brightness", RUN+="/bin/chmod g+w $sys$devpath/brightness"' \
-        | sudo tee -a /etc/udev/rules.d/backlight.rules >/dev/null
-fi
-c_ok "Backlight rule in place."
-
-# ---------------------------------------------------------------------------
-# 11. themed icon (so COSMIC renders it)
-# ---------------------------------------------------------------------------
-c_info "[11/13] Installing gaming-mode icon into the hicolor theme..."
-mkdir -p "$HOME/arch-deckify"
-if [ ! -f "$HOME/arch-deckify/${ICON_NAME}.png" ]; then
-    wget -qO "$HOME/arch-deckify/${ICON_NAME}.png" "$ICON_URL" \
+c_info "[13/13] Creating 'Return to Gaming Mode' shortcut..."
+ICON_URL="https://raw.githubusercontent.com/unlbslk/arch-deckify/refs/heads/main/icons/${ICON_NAME}.png"
+mkdir -p "$HOME/.local/share/icons/hicolor/256x256/apps" "$HOME/.local/share/applications"
+if [ ! -f "$HOME/.local/share/icons/hicolor/256x256/apps/${ICON_NAME}.png" ]; then
+    wget -qO "$HOME/.local/share/icons/hicolor/256x256/apps/${ICON_NAME}.png" "$ICON_URL" \
         || c_warn "Icon download failed; shortcut will fall back to a generic icon."
 fi
-if [ -f "$HOME/arch-deckify/${ICON_NAME}.png" ]; then
-    install -Dm644 "$HOME/arch-deckify/${ICON_NAME}.png" \
-        "$HOME/.local/share/icons/hicolor/256x256/apps/${ICON_NAME}.png"
-    command -v gtk-update-icon-cache >/dev/null \
-        && gtk-update-icon-cache -f "$HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true
-    c_ok "Icon installed as themed name '$ICON_NAME'."
-fi
-
-# ---------------------------------------------------------------------------
-# 12. Return to Gaming Mode shortcut (desktop + user application menu)
-# ---------------------------------------------------------------------------
-c_info "[12/13] Creating 'Return to Gaming Mode' shortcut..."
 ENTRY="[Desktop Entry]
 Type=Application
 Name=Return to Gaming Mode
-Comment=Reboot into the Steam gamescope gaming session
+Comment=Switch to the Steam gamescope gaming session
 Exec=steamos-session-select gamescope
 Icon=${ICON_NAME}
 Terminal=false
 Categories=Game;
 StartupNotify=false"
-
 DESKTOP_DIR="$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop")"
-mkdir -p "$DESKTOP_DIR" "$HOME/.local/share/applications"
+mkdir -p "$DESKTOP_DIR"
 printf '%s\n' "$ENTRY" > "$DESKTOP_DIR/$SHORTCUT"
 printf '%s\n' "$ENTRY" > "$HOME/.local/share/applications/$SHORTCUT"
 chmod +x "$DESKTOP_DIR/$SHORTCUT" "$HOME/.local/share/applications/$SHORTCUT"
-command -v update-desktop-database >/dev/null \
-    && update-desktop-database "$HOME/.local/share/applications" >/dev/null 2>&1 || true
-c_ok "Shortcut created on desktop and in the app menu."
-
-# ---------------------------------------------------------------------------
-# 13. Bluetooth
-# ---------------------------------------------------------------------------
-c_info "[13/13] Enabling Bluetooth..."
-sudo pacman -S bluez bluez-utils --noconfirm
-sudo systemctl enable --now bluetooth.service
-c_ok "Bluetooth enabled."
+command -v update-desktop-database >/dev/null && update-desktop-database "$HOME/.local/share/applications" >/dev/null 2>&1 || true
+c_ok "Shortcut created."
 
 # ---------------------------------------------------------------------------
 # Done
 # ---------------------------------------------------------------------------
 echo -e "\n\e[1;33mInstallation complete.\e[0m\n"
-echo "  • Reboot once now; you'll land in your desktop ($selected_de)."
-echo "  • Click 'Return to Gaming Mode' to reboot straight into gamescope."
-echo "  • From gaming mode, Steam's 'Switch to Desktop' returns you to $selected_de (live, no reboot)."
-echo "  • COSMIC caches desktop icons — if the icon looks blank, log out/in once."
-echo "  • Prefer the classic live handoff? Set SWITCH_METHOD=\"live\" in $SWITCHER."
-echo "  • Uninstall anytime:  bash uninstall.sh"
+echo "  • Reboot once now (needed either way: greetd is only just starting to"
+echo "    manage your session, and NVIDIA's initramfs change needs it too)."
+echo "  • You'll land in COSMIC automatically."
+echo "  • Super+Shift+S switches to Gaming Mode (Steam Big Picture / gamescope)."
+echo "  • Super+Shift+R switches back to COSMIC — works even while gamescope"
+echo "    has the screen, since swhkd reads raw input independent of it."
+echo "  • Steam's own 'Switch to Desktop' button does the same as Super+Shift+R."
+if [ "$IS_NVIDIA" -eq 1 ]; then
+    echo -e "\n  \e[33mNVIDIA note:\e[0m the switch defaults to a fast 'systemctl restart"
+    echo "  greetd' rather than a live handoff, because NVIDIA doesn't reliably"
+    echo "  release DRM master to a second compositor in place. This has NOT been"
+    echo "  verified on your specific driver/kernel combination — if the screen"
+    echo "  goes black instead of switching, edit SWITCH_METHOD in:"
+    echo "    $SWITCH_HELPER"
+    echo "  and set it to \"reboot\" for a guaranteed-clean (but slower) switch."
+fi
+echo -e "\n  • Uninstall anytime:  bash uninstall.sh"

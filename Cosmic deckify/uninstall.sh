@@ -1,20 +1,22 @@
 #!/bin/bash
 #
-# uninstall.sh — Arch Deckify (COSMIC / NVIDIA edition)
+# uninstall.sh — Cosmic Deckify
 # ---------------------------------------------------------------------------
-# Reverses what install.sh set up. Removes the gamescope session, the
-# steamos-session-select switcher, the sudoers rule, the shortcut + icon, and
-# disables SDDM autologin (so you get a normal login greeter back).
+# Reverses install.sh: removes the swhkd hotkey daemon + units, the
+# os-session-select hook, the switch helper, the sudoers rule, the shortcut +
+# icon, and resets greetd back to its stock greeter config (no more autologin).
 #
 # It does NOT remove general packages you may want to keep (Steam, gamescope,
-# mangohud, ntfs-3g, wget, bluez) — only the deckify-specific gamescope session.
+# COSMIC itself, nvidia drivers) — only the Deckify-specific glue.
 # ---------------------------------------------------------------------------
 
 set -uo pipefail
 
-SWITCHER="/usr/bin/steamos-session-select"
-SDDM_CONF="/etc/sddm.conf"
-SUDOERS_FILE="/etc/sudoers.d/sddm_config_edit"
+GREETD_CONF="/etc/greetd/config.toml"
+SWITCH_HELPER="/usr/local/bin/deckify-session-switch"
+OS_SESSION_SELECT="/usr/lib/os-session-select"
+SUDOERS_FILE="/etc/sudoers.d/deckify-session-switch"
+SWHKD_CONF="/etc/swhkd/swhkdrc"
 ICON_NAME="steam-gaming-return"
 SHORTCUT="Return_to_Gaming_Mode.desktop"
 DESKTOP_DIR="$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop")"
@@ -29,70 +31,79 @@ if [ "$EUID" -eq 0 ]; then
     exit 1
 fi
 
-echo -e "\n\e[1;33mArch Deckify — Uninstaller\e[0m"
+echo -e "\n\e[1;33mCosmic Deckify — Uninstaller\e[0m"
 echo    "This will REMOVE:"
-echo    "  • gamescope-session-steam-git (the gaming session)"
-echo    "  • $SWITCHER (session switcher)"
-echo    "  • $SUDOERS_FILE (passwordless Session= rule)"
+echo    "  • swhkd.service (system) and swhks.service (user), and swhkd-git"
+echo    "  • gamescope-session-steam-git / gamescope-session-git"
+echo    "  • $OS_SESSION_SELECT and $SWITCH_HELPER"
+echo    "  • $SUDOERS_FILE"
 echo    "  • 'Return to Gaming Mode' shortcut (desktop + app menu) and its icon"
-echo    "  • SDDM autologin (disabled — you'll get a normal greeter)"
+echo    "  • greetd autologin (reset to the stock greeter — you'll get a login prompt)"
 echo
-echo -e "\e[1;30mThis will NOT remove: Steam, gamescope, mangohud, ntfs-3g, wget, bluez,\e[0m"
-echo -e "\e[1;30mor your desktop environment.\e[0m"
+echo -e "\e[1;30mThis will NOT remove: Steam, gamescope, COSMIC, mangohud, nvidia drivers,\e[0m"
+echo -e "\e[1;30mor the nvidia_drm.modeset=1 modprobe config.\e[0m"
 echo
 read -rp "Proceed? (y/n): " ans
 [[ "$ans" =~ ^[Yy]$ ]] || { echo "Cancelled. Nothing changed."; exit 0; }
 
-sudo -v   # prime sudo
+sudo -v
 
-# --- 1. gamescope session package -----------------------------------------
-c_info "Removing gamescope-session-steam-git..."
-if pacman -Qq 2>/dev/null | grep -q '^gamescope-session-steam-git$'; then
-    yay -Rns --noconfirm gamescope-session-steam-git 2>/dev/null \
-        || paru -Rns --noconfirm gamescope-session-steam-git 2>/dev/null \
-        || sudo pacman -Rns --noconfirm gamescope-session-steam-git 2>/dev/null \
-        || c_warn "Could not remove the package automatically — remove it by hand if needed."
-    c_ok "gamescope-session-steam-git removed."
+# --- 1. swhkd hotkey daemon --------------------------------------------------
+c_info "Stopping and removing swhkd/swhks..."
+sudo systemctl disable --now swhkd.service 2>/dev/null || true
+systemctl --user disable --now swhks.service 2>/dev/null || true
+sudo rm -f /etc/systemd/system/swhkd.service
+rm -f "$HOME/.config/systemd/user/swhks.service"
+sudo systemctl daemon-reload
+systemctl --user daemon-reload
+sudo rm -f "$SWHKD_CONF"
+yay -Rns --noconfirm swhkd-git 2>/dev/null || paru -Rns --noconfirm swhkd-git 2>/dev/null || true
+c_ok "swhkd removed."
+
+# --- 2. gamescope session package -------------------------------------------
+c_info "Removing gamescope-session-steam-git / gamescope-session-git..."
+if pacman -Qq gamescope-session-steam-git &>/dev/null; then
+    # Mark these explicit first so `-Rns`'s orphan-removal cascade can never take
+    # them with it, regardless of what install reason they happen to carry.
+    sudo pacman -D --asexplicit gamescope steam 2>/dev/null || true
+    yay -Rns --noconfirm gamescope-session-steam-git gamescope-session-git 2>/dev/null \
+        || paru -Rns --noconfirm gamescope-session-steam-git gamescope-session-git 2>/dev/null \
+        || c_warn "Could not remove automatically — remove by hand if needed."
+    c_ok "Removed."
 else
-    c_warn "gamescope-session-steam-git not installed (skipped)."
+    c_warn "Not installed (skipped)."
 fi
 
-# --- 2. switcher + sudoers -------------------------------------------------
-c_info "Removing switcher and sudoers rule..."
-sudo rm -f "$SWITCHER" "$SUDOERS_FILE"
-c_ok "Removed $SWITCHER and the sudoers rule."
+# --- 3. hook, helper, sudoers ------------------------------------------------
+c_info "Removing os-session-select hook, switch helper, and sudoers rule..."
+sudo rm -f "$OS_SESSION_SELECT" "$SWITCH_HELPER" "$SUDOERS_FILE"
+c_ok "Removed."
 
-# --- 3. shortcuts + icon ---------------------------------------------------
+# --- 4. shortcut + icon ------------------------------------------------------
 c_info "Removing shortcut and icon..."
 rm -f "$DESKTOP_DIR/$SHORTCUT" "$HOME/.local/share/applications/$SHORTCUT"
 rm -f "$HOME/.local/share/icons/hicolor/256x256/apps/${ICON_NAME}.png"
-command -v gtk-update-icon-cache >/dev/null \
-    && gtk-update-icon-cache -f "$HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true
-command -v update-desktop-database >/dev/null \
-    && update-desktop-database "$HOME/.local/share/applications" >/dev/null 2>&1 || true
-c_ok "Shortcut and icon removed."
+command -v update-desktop-database >/dev/null && update-desktop-database "$HOME/.local/share/applications" >/dev/null 2>&1 || true
+c_ok "Removed."
 
-# --- 4. SDDM autologin -----------------------------------------------------
-if [ -f "$SDDM_CONF" ]; then
-    c_info "Disabling SDDM autologin..."
-    sudo cp "$SDDM_CONF" "$SDDM_CONF.deckify.bak" 2>/dev/null || true
-    sudo sed -i 's/^Relogin=true/Relogin=false/; s/^User=.*/User=/; s/^Session=.*/Session=/' "$SDDM_CONF"
-    c_ok "Autologin disabled (backup at $SDDM_CONF.deckify.bak)."
+# --- 5. greetd autologin -----------------------------------------------------
+if [ -f "$GREETD_CONF" ]; then
+    c_info "Resetting greetd to its stock (non-autologin) config..."
+    sudo cp "$GREETD_CONF" "$GREETD_CONF.deckify.bak" 2>/dev/null || true
+    sudo tee "$GREETD_CONF" >/dev/null <<'EOF'
+[terminal]
+vt = 1
+
+[default_session]
+command = "agreety --cmd /bin/sh"
+user = "greeter"
+EOF
+    c_ok "greetd reset (backup at $GREETD_CONF.deckify.bak). Consider installing a graphical"
+    c_ok "greeter (e.g. cosmic-greeter or greetd-tuigreet) if you want one back."
 else
-    c_warn "$SDDM_CONF not found (skipped)."
-fi
-
-# --- 5. optional: remove the ~/arch-deckify working dir --------------------
-if [ -d "$HOME/arch-deckify" ]; then
-    read -rp $'\nAlso delete the ~/arch-deckify folder (downloaded icon etc.)? (y/n): ' d
-    if [[ "$d" =~ ^[Yy]$ ]]; then
-        rm -rf "$HOME/arch-deckify"
-        c_ok "Removed ~/arch-deckify."
-    fi
+    c_warn "$GREETD_CONF not found (skipped)."
 fi
 
 echo
 c_ok "Uninstall complete."
-echo    "  • Reboot to return to a normal SDDM login greeter."
-echo    "  • If you removed the CachyOS gamescope session during install and want it"
-echo    "    back:  sudo pacman -S gamescope-session-cachyos"
+echo    "  • Restart greetd (or reboot) to apply: sudo systemctl restart greetd"
