@@ -1,96 +1,45 @@
 # 🎮 Cosmic Deckify
 
-Turns a vanilla Arch + COSMIC install into a SteamOS-style two-mode machine:
-**COSMIC desktop** and **gamescope Gaming Mode (Steam Big Picture)**, switched
-with **Super+Shift+S** (desktop → gaming) and **Super+Shift+R** (gaming →
-desktop) — no reboot required to get back, and the hotkeys work no matter
-which of the two sessions currently owns the screen.
+Turns an Arch Linux + COSMIC desktop into a two-mode machine, Steam Deck
+style: your regular desktop, and a full-screen **Gaming Mode** built around
+Steam Big Picture.
 
----
+## What it does
 
-## How it actually works
+- Adds a **Gaming Mode** — a console-style, controller-friendly Steam Big
+  Picture screen that takes over the whole display. No desktop, taskbar, or
+  windows in the way, just your games.
+- Lets you jump between your COSMIC desktop and Gaming Mode instantly with a
+  hotkey, in either direction, with no reboot required.
+- Adds a "Return to Gaming Mode" desktop shortcut as a mouse-driven
+  alternative to the hotkey.
+- Keeps itself working after system updates — if a package update changes
+  how the gaming session starts, Cosmic Deckify quietly adjusts instead of
+  breaking.
 
-This isn't a reboot-and-a-desktop-icon script. Three things had to be true at
-once, and each was verified against the real packages (not assumed):
+## Switching modes
 
-- **greetd, not SDDM.** Vanilla Arch + COSMIC boots via `greetd` +
-  `cosmic-greeter`. greetd's `default_session` is normally "the greeter," but
-  per `greetd(1)`/`greetd(5)`, pointing it straight at a real session command
-  *is* its auto-login mechanism: "the default session ... started again
-  whenever no session is running, such as when the user logs out." greetd's
-  source confirms `config.toml` is read exactly once at daemon startup (no
-  reload/SIGHUP support) — so switching sessions means editing the config
-  **and** restarting `greetd.service`, not just logging out.
-- **The gaming session's own switcher is left alone.**
-  `gamescope-session-steam-git` (AUR) ships its own `/usr/bin/steamos-session-select`
-  — a thin dispatcher that execs `/usr/lib/os-session-select` if present. This
-  project writes *that* file instead of overwriting the package's own script,
-  so a `pacman -Syu` upgrade of the AUR package can't silently revert your
-  switching logic.
-- **Super+Shift+R has to work from inside gamescope**, where COSMIC (and its
-  keybinding system) isn't even running. [swhkd](https://github.com/waycrate/swhkd)
-  reads keyboard input directly from `/dev/input`, underneath any Wayland
-  compositor, so the hotkey works regardless of which session currently has
-  the screen. It ships no systemd units upstream, so this project writes them.
-
-## The one thing that can't be verified from a script
-
-If you're on **NVIDIA**: its proprietary driver is widely reported to not
-release DRM master cleanly to a second compositor on a live handoff. The
-switch here uses `systemctl restart greetd` (which forcibly kills the whole
-session's cgroup, rather than a polite compositor-side logout) as a
-faster-than-reboot middle ground — but whether *your* specific driver/kernel
-combination hands off cleanly through that isn't something any installer can
-know in advance. If Super+Shift+S black-screens instead of switching, open:
-
-```
-/usr/local/bin/deckify-session-switch
-```
-
-and change `SWITCH_METHOD="restart"` to `SWITCH_METHOD="reboot"`. Slower, but
-guaranteed to reset the GPU state fully.
-
-On AMD/Intel this isn't expected to be an issue — their open-source KMS
-drivers hand off DRM master between compositors as a matter of course.
-
----
-
-## Requirements
-
-- Arch Linux (or an Arch-based distro) with COSMIC already the target desktop
-- An AUR helper (`yay`/`paru`) — installed automatically if missing
-- Steam, gamescope, and the underlying VT/session-management this script sets up
+- **Desktop → Gaming Mode:** press `Super + Shift + S`, or click the desktop
+  shortcut
+- **Gaming Mode → Desktop:** press `Super + Shift + R`, or use Steam's own
+  "Switch to Desktop" option — both work even while Gaming Mode has full
+  control of the screen
 
 ## Install
-
-Review the script first, then run it **without sudo**:
 
 ```bash
 bash install.sh
 ```
 
-It will:
-1. Install COSMIC + greetd (if not already present), Steam + gamescope
-2. Install `gamescope-session-git` + `gamescope-session-steam-git` and
-   `swhkd-git` from the AUR
-3. (NVIDIA only) set `nvidia_drm.modeset=1` and add early-KMS modules to
-   `mkinitcpio.conf`, rebuilding the initramfs
-4. Configure greetd to auto-launch COSMIC on login
-5. Write the session-switch helper, the `os-session-select` hook, a narrowly
-   scoped sudoers rule (two literal commands, no wildcards), and the swhkd
-   hotkey config + systemd units
-6. Add a "Return to Gaming Mode" desktop shortcut as a mouse-driven fallback
+Installs everything needed (Steam, gamescope, the hotkey daemon, and some
+Arch/COSMIC-specific setup), then asks for a reboot once it's done. After
+that, you land straight in your COSMIC desktop and both hotkeys are live.
 
-**Reboot once** when it finishes — needed regardless of GPU, since greetd is
-only just taking over session management (and NVIDIA's initramfs change needs
-it too).
+Check what's currently set up at any time with:
 
-## Using it
-
-- **Desktop → Gaming:** press **Super+Shift+S**, or click the desktop shortcut
-- **Gaming → Desktop:** press **Super+Shift+R**, or use Steam's own
-  *Switch to Desktop* (Power menu) — both go through the same
-  `steamos-session-select` path
+```bash
+bash install.sh --status
+```
 
 ## Uninstall
 
@@ -98,21 +47,30 @@ it too).
 bash uninstall.sh
 ```
 
-Removes swhkd/swhks, the `os-session-select` hook, the switch helper, the
-sudoers rule, the desktop shortcut, and the `gamescope-session-*` AUR
-packages — then resets greetd to its stock (non-autologin) config. Leaves
-Steam, gamescope, COSMIC, and any NVIDIA driver packages installed and marked
-explicit, so they aren't swept up as "unneeded dependencies."
+Removes Gaming Mode, the hotkeys, and everything Cosmic Deckify added,
+leaving your regular COSMIC desktop exactly as it was. Steam and your
+graphics drivers are left in place.
 
----
+## Notes
+
+- Built for Arch Linux (or an Arch-based distro) running COSMIC as the
+  desktop.
+- On NVIDIA graphics, mode switches happen via a quick, safe restart rather
+  than an instant handoff, since NVIDIA doesn't always hand off cleanly
+  between the two modes live. If a switch ever misbehaves, there's a
+  slower-but-guaranteed fallback described inside the script.
+- Occasionally the "back to desktop" hotkey doesn't fire while Gaming Mode
+  has the screen — Steam's own "Switch to Desktop" button always works as a
+  backup.
+- If the hotkeys ever stop working entirely, just re-run `bash install.sh` —
+  it's safe to run again and will repair anything that's drifted.
 
 ## Credits
 
 Built on the [ChimeraOS gamescope-session](https://github.com/ChimeraOS/gamescope-session-steam)
-/ `OpenGamingCollective/gamescope-session-steam` project and
-[waycrate/swhkd](https://github.com/waycrate/swhkd). All Steam / SteamOS /
-Steam Deck / Valve names and logos belong to their respective owners; this
-project is not affiliated with or endorsed by any of them.
+project and [triggerhappy](https://github.com/wertarbyte/triggerhappy). Steam,
+SteamOS, and Steam Deck names/logos belong to Valve; this project isn't
+affiliated with or endorsed by them.
 
-> ⚠️ This script edits greetd config, sudoers, mkinitcpio/kernel modules, and
-> system packages. Back up first and use at your own risk.
+> ⚠️ This script edits system configuration (greetd, sudoers, kernel modules)
+> and installs packages. Back up first and use at your own risk.
