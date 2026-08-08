@@ -116,7 +116,7 @@ fi
 # ---------------------------------------------------------------------------
 # 1. AUR helper
 # ---------------------------------------------------------------------------
-c_info "[1/14] Checking for an AUR helper..."
+c_info "[1/15] Checking for an AUR helper..."
 if command -v yay &>/dev/null; then c_ok "yay present."
 elif command -v paru &>/dev/null; then c_ok "paru present."
 else
@@ -132,7 +132,7 @@ AUR_HELPER="$(command -v yay || command -v paru)"
 # ---------------------------------------------------------------------------
 # 2. multilib + system update
 # ---------------------------------------------------------------------------
-c_info "[2/14] Ensuring multilib is enabled..."
+c_info "[2/15] Ensuring multilib is enabled..."
 if ! grep -q "^\[multilib\]" /etc/pacman.conf; then
     echo -e "\n[multilib]\nInclude = /etc/pacman.d/mirrorlist" | sudo tee -a /etc/pacman.conf >/dev/null
     c_ok "multilib enabled."
@@ -145,7 +145,7 @@ sudo pacman -Syu --noconfirm
 # ---------------------------------------------------------------------------
 # 3. COSMIC + greetd
 # ---------------------------------------------------------------------------
-c_info "[3/14] Installing COSMIC desktop + greetd..."
+c_info "[3/15] Installing COSMIC desktop + greetd..."
 sudo pacman -S --needed --noconfirm cosmic greetd greetd-tuigreet
 for pkg in cosmic-session cosmic-comp cosmic-greeter greetd; do
     pacman -Qq "$pkg" &>/dev/null || { c_err "$pkg failed to install — check the pacman output above (e.g. a file conflict) and re-run."; exit 1; }
@@ -155,7 +155,7 @@ c_ok "COSMIC + greetd installed."
 # ---------------------------------------------------------------------------
 # 4. Steam + gamescope
 # ---------------------------------------------------------------------------
-c_info "[4/14] Installing Steam + gamescope..."
+c_info "[4/15] Installing Steam + gamescope..."
 sudo pacman -S --needed --noconfirm steam gamescope
 for pkg in steam gamescope; do
     pacman -Qq "$pkg" &>/dev/null || { c_err "$pkg failed to install — check the pacman output above and re-run."; exit 1; }
@@ -163,9 +163,24 @@ done
 c_ok "Steam + gamescope installed."
 
 # ---------------------------------------------------------------------------
-# 5. gamescope-session-steam-git (AUR)
+# 5. Proton Command Center (AUR) — per-game launch options, DLSS/ReShade
+#    management, and shader cache control for the Steam library this
+#    installer just set up. Optional: a failure here doesn't affect session
+#    switching, so it warns and continues rather than exiting.
 # ---------------------------------------------------------------------------
-c_info "[5/14] Installing gamescope-session-steam-git (AUR)..."
+c_info "[5/15] Installing Proton Command Center (AUR)..."
+if "$AUR_HELPER" -S --noconfirm --needed proton-command-center; then
+    systemctl --user enable --now proton-command-center.service 2>/dev/null \
+        && c_ok "Proton Command Center installed — http://localhost:8686" \
+        || c_warn "Installed, but couldn't enable the user service — run manually: systemctl --user enable --now proton-command-center"
+else
+    c_warn "Proton Command Center failed to install (non-fatal, continuing) — install later with: yay -S proton-command-center"
+fi
+
+# ---------------------------------------------------------------------------
+# 6. gamescope-session-steam-git (AUR)
+# ---------------------------------------------------------------------------
+c_info "[6/15] Installing gamescope-session-steam-git (AUR)..."
 "$AUR_HELPER" -S --noconfirm --needed aur/gamescope-session-git aur/gamescope-session-steam-git
 if ! pacman -Qq gamescope-session-steam-git &>/dev/null; then
     c_err "gamescope-session-steam-git did not install. Re-run after checking for AUR conflicts."
@@ -176,17 +191,17 @@ c_ok "gamescope-session-steam-git installed."
     || c_warn "Expected session file not found — the AUR package may have changed layout."
 
 # ---------------------------------------------------------------------------
-# 6. triggerhappy (AUR) — global hotkey daemon, works underneath any compositor
+# 7. triggerhappy (AUR) — global hotkey daemon, works underneath any compositor
 # ---------------------------------------------------------------------------
-c_info "[6/14] Installing triggerhappy (AUR)..."
+c_info "[7/15] Installing triggerhappy (AUR)..."
 "$AUR_HELPER" -S --noconfirm --needed aur/triggerhappy
 command -v thd &>/dev/null || { c_err "triggerhappy install failed."; exit 1; }
 c_ok "triggerhappy installed."
 
 # ---------------------------------------------------------------------------
-# 7. NVIDIA: nvidia_drm.modeset=1 + early KMS (only if NVIDIA present)
+# 8. NVIDIA: nvidia_drm.modeset=1 + early KMS (only if NVIDIA present)
 # ---------------------------------------------------------------------------
-c_info "[7/14] NVIDIA modeset check..."
+c_info "[8/15] NVIDIA modeset check..."
 if [ "$IS_NVIDIA" -eq 1 ]; then
     if ! { pacman -Qq nvidia &>/dev/null || pacman -Qq nvidia-open &>/dev/null; }; then
         c_warn "No nvidia/nvidia-open driver package detected."
@@ -212,14 +227,14 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 8. Session launcher + greetd config: state-file driven autologin.
+# 9. Session launcher + greetd config: state-file driven autologin.
 #    greetd only reads config.toml once, at its own startup (no SIGHUP/
 #    reload support) — so config.toml is written ONCE here and never
 #    touched again by a switch. Switching instead rewrites a small state
 #    file that $SESSION_LAUNCH re-reads fresh every time greetd (re)execs
 #    it, so COSMIC_CMD/GAMESCOPE_CMD only ever need to live in one place.
 # ---------------------------------------------------------------------------
-c_info "[8/14] Writing $SESSION_LAUNCH..."
+c_info "[9/15] Writing $SESSION_LAUNCH..."
 sudo tee "$SESSION_LAUNCH" >/dev/null <<EOF
 #!/bin/bash
 # Generated by Cosmic Deckify. Execed by greetd as the configured
@@ -282,9 +297,9 @@ if systemctl list-unit-files cosmic-greeter.service &>/dev/null; then
 fi
 
 # ---------------------------------------------------------------------------
-# 9. Root switch helper — the only thing sudoers grants NOPASSWD access to
+# 10. Root switch helper — the only thing sudoers grants NOPASSWD access to
 # ---------------------------------------------------------------------------
-c_info "[9/14] Writing $SWITCH_HELPER..."
+c_info "[10/15] Writing $SWITCH_HELPER..."
 sudo tee "$SWITCH_HELPER" >/dev/null <<EOF
 #!/bin/bash
 # Generated by Cosmic Deckify.
@@ -436,7 +451,7 @@ sudo chown root:root "$SWITCH_HELPER"
 c_ok "Switch helper written."
 
 # ---------------------------------------------------------------------------
-# 10. Self-healing pacman hooks — if gamescope-session-steam-git/gamescope-
+# 11. Self-healing pacman hooks — if gamescope-session-steam-git/gamescope-
 #     session-git or cosmic-session ever change the Exec= line of their
 #     wayland session (a rename, a new wrapper, etc.), GAMESCOPE_CMD/
 #     COSMIC_CMD baked into $SESSION_LAUNCH would silently go stale. These
@@ -445,7 +460,7 @@ c_ok "Switch helper written."
 #     $SESSION_LAUNCH. greetd's config.toml never needs touching here — it
 #     always points at $SESSION_LAUNCH, never directly at a session command.
 # ---------------------------------------------------------------------------
-c_info "[10/14] Installing self-healing pacman hooks for session updates..."
+c_info "[11/15] Installing self-healing pacman hooks for session updates..."
 SYNC_SCRIPT="/usr/local/bin/deckify-sync-session"
 sudo tee "$SYNC_SCRIPT" >/dev/null <<'EOF'
 #!/bin/bash
@@ -534,10 +549,10 @@ EOF
 c_ok "Self-healing pacman hooks installed (gamescope-session-*, cosmic-session)."
 
 # ---------------------------------------------------------------------------
-# 11. os-session-select hook — the AUR package's own steamos-session-select
+# 12. os-session-select hook — the AUR package's own steamos-session-select
 #     dispatches here; we do NOT touch /usr/bin/steamos-session-select itself.
 # ---------------------------------------------------------------------------
-c_info "[11/14] Writing $OS_SESSION_SELECT..."
+c_info "[12/15] Writing $OS_SESSION_SELECT..."
 sudo mkdir -p "$(dirname "$OS_SESSION_SELECT")"
 sudo tee "$OS_SESSION_SELECT" >/dev/null <<EOF
 #!/bin/bash
@@ -559,9 +574,9 @@ sudo chmod 755 "$OS_SESSION_SELECT"
 c_ok "os-session-select hook installed."
 
 # ---------------------------------------------------------------------------
-# 12. sudoers — two literal commands only, no wildcards
+# 13. sudoers — two literal commands only, no wildcards
 # ---------------------------------------------------------------------------
-c_info "[12/14] Adding sudoers rule..."
+c_info "[13/15] Adding sudoers rule..."
 SUDOERS_TMP="$(mktemp)"
 cat > "$SUDOERS_TMP" <<EOF
 $TARGET_USER ALL=(root) NOPASSWD: $SWITCH_HELPER gamescope
@@ -589,9 +604,9 @@ fi
 rm -f "$SUDOERS_TMP"
 
 # ---------------------------------------------------------------------------
-# 13. triggerhappy: hotkeys + systemd unit (none are shipped by the AUR package)
+# 14. triggerhappy: hotkeys + systemd unit (none are shipped by the AUR package)
 # ---------------------------------------------------------------------------
-c_info "[13/14] Configuring Super+Shift+S / Super+Shift+R hotkeys..."
+c_info "[14/15] Configuring Super+Shift+S / Super+Shift+R hotkeys..."
 
 # Migrate off a previous install's swhkd/swhks (dropped for triggerhappy):
 # swhkd's root+pkexec/client-server-IPC model needed a loginuid workaround,
@@ -661,9 +676,9 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 14. Desktop shortcut (mouse-driven fallback alongside the hotkey)
+# 15. Desktop shortcut (mouse-driven fallback alongside the hotkey)
 # ---------------------------------------------------------------------------
-c_info "[14/14] Creating 'Return to Gaming Mode' shortcut..."
+c_info "[15/15] Creating 'Return to Gaming Mode' shortcut..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$HOME/.local/share/icons/hicolor/256x256/apps" "$HOME/.local/share/applications"
 if [ -f "$SCRIPT_DIR/icons/${ICON_NAME}.png" ]; then

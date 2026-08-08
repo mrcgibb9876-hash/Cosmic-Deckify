@@ -7,7 +7,8 @@
 # icon, and resets greetd back to its stock greeter config (no more autologin).
 #
 # It does NOT remove general packages you may want to keep (Steam, gamescope,
-# COSMIC itself, nvidia drivers) — only the Deckify-specific glue.
+# COSMIC itself, nvidia drivers, Proton Command Center) — only the
+# Deckify-specific glue.
 # ---------------------------------------------------------------------------
 
 set -uo pipefail

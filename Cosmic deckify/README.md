@@ -31,9 +31,11 @@ Steam Big Picture.
 bash install.sh
 ```
 
-Installs everything needed (Steam, gamescope, the hotkey daemon, and some
-Arch/COSMIC-specific setup), then asks for a reboot once it's done. After
-that, you land straight in your COSMIC desktop and both hotkeys are live.
+Installs everything needed (Steam, gamescope, the hotkey daemon, [Proton
+Command Center](https://github.com/mrcgibb9876-hash/proton_command_center)
+for per-game launch options/DLSS/ReShade, and some Arch/COSMIC-specific
+setup), then asks for a reboot once it's done. After that, you land straight
+in your COSMIC desktop and both hotkeys are live.
 
 Check what's currently set up at any time with:
 
